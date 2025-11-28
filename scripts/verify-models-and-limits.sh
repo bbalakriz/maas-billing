@@ -178,10 +178,7 @@ for idx in "${!MODEL_IDS[@]}"; do
         REQUEST_BODY=$(cat <<EOF
 {
   "model": "$model_id",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant. Keep responses brief."},
-    {"role": "user", "content": "$prompt"}
-  ],
+  "prompt": "$prompt",
   "temperature": 0.1,
   "max_tokens": 50
 }
@@ -194,7 +191,7 @@ EOF
             -X POST \
             -d "$REQUEST_BODY" \
             -w "\nHTTP_STATUS:%{http_code}\n" \
-            "${model_url}/v1/chat/completions" 2>&1)
+            "${model_url}/v1/completions" 2>&1)
         
         http_status=$(echo "$response" | grep "HTTP_STATUS:" | cut -d':' -f2)
         response_body=$(echo "$response" | sed '/HTTP_STATUS:/d')
@@ -203,7 +200,7 @@ EOF
             echo -e "${GREEN}Status: $http_status (Success)${NC}"
             model_success=1
             
-            answer=$(echo "$response_body" | jq -r '.choices[0].message.content // "No response"' 2>/dev/null)
+            answer=$(echo "$response_body" | jq -r '.choices[0].text // "No response"' 2>/dev/null)
             tokens_used=$(echo "$response_body" | jq -r '.usage.total_tokens // 0' 2>/dev/null)
             
             echo -e "${CYAN}Response:${NC} $answer"
@@ -244,9 +241,7 @@ else
     REQUEST_BODY_SIMPLE=$(cat <<EOF
 {
   "model": "$model_id",
-  "messages": [
-    {"role": "user", "content": "Count to 5"}
-  ],
+  "prompt": "Count to 5",
   "temperature": 0.1,
   "max_tokens": 30
 }
@@ -265,7 +260,7 @@ EOF
             -X POST \
             -d "$REQUEST_BODY_SIMPLE" \
             -w "\nHTTP_STATUS:%{http_code}\n" \
-            "${model_url}/v1/chat/completions" 2>&1)
+            "${model_url}/v1/completions" 2>&1)
         
         http_status=$(echo "$response" | grep "HTTP_STATUS:" | cut -d':' -f2)
         

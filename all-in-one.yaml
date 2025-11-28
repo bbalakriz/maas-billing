@@ -1,0 +1,728 @@
+#################################################################################
+# MaaS Billing All-in-One Deployment Manifest
+#################################################################################
+# This manifest contains all resources needed to deploy the MaaS Billing platform
+# on OpenShift 4.19.9+ or any Kubernetes cluster with Gateway API support.
+#
+# PREREQUISITES:
+# 1. OpenShift 4.19.9+ (or enable Gateway API feature gates for older versions)
+# 2. OLM (Operator Lifecycle Manager) installed
+# 3. kubectl/oc CLI configured
+# 4. Cluster admin permissions
+#
+# BEFORE APPLYING:
+# Replace ${CLUSTER_DOMAIN} with your actual cluster domain:
+#   export CLUSTER_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+#   envsubst '$CLUSTER_DOMAIN' < all-in-one.yaml | oc apply -f -
+#
+# Or manually replace all occurrences of ${CLUSTER_DOMAIN} with your domain
+#
+# DEPLOYMENT ORDER (DO NOT CHANGE):
+# 1. Namespaces
+# 2. Kuadrant Operators (OLM)
+# 3. Gateway Infrastructure
+# 4. Kuadrant CR (requires operators to be ready)
+# 5. MaaS API Components
+# 6. Gateway Policies (requires Kuadrant CRDs)
+# 7. Observability
+#
+# POST-DEPLOYMENT STEPS:
+# 1. Wait for Kuadrant operators to be installed (~3-5 minutes)
+# 2. Patch AuthPolicy audience (see deploy-openshift.sh line 316-328)
+# 3. Update Limitador image (see deploy-openshift.sh line 333-336)
+# 4. Deploy models using samples from docs/samples/models/
+#
+#################################################################################
+
+---
+#################################################################################
+# SECTION 1: NAMESPACES
+#################################################################################
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opendatahub
+  labels:
+    app.kubernetes.io/part-of: maas-billing
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kserve
+  labels:
+    app.kubernetes.io/part-of: maas-billing
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kuadrant-system
+  labels:
+    app.kubernetes.io/part-of: maas-billing
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+  labels:
+    app.kubernetes.io/part-of: maas-billing
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maas-api
+  labels:
+    app.kubernetes.io/part-of: maas-billing
+
+---
+#################################################################################
+# SECTION 2: KUADRANT OPERATORS INSTALLATION (OLM)
+#################################################################################
+# Note: Wait for these operators to be fully installed before proceeding
+# Check with: oc get csv -n kuadrant-system
+#################################################################################
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: kuadrant-operator-group
+  namespace: kuadrant-system
+spec: {}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: kuadrant-operator-catalog
+  namespace: kuadrant-system
+spec:
+  displayName: Kuadrant Operators
+  grpcPodConfig:
+    securityContextConfig: restricted
+  image: 'quay.io/kuadrant/kuadrant-operator-catalog:v1.3.0'
+  publisher: grpc
+  sourceType: grpc
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: kuadrant-operator
+  namespace: kuadrant-system
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: kuadrant-operator
+  source: kuadrant-operator-catalog
+  sourceNamespace: kuadrant-system
+
+---
+#################################################################################
+# SECTION 3: GATEWAY INFRASTRUCTURE
+#################################################################################
+# OpenShift Gateway Class and Gateways
+#################################################################################
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: openshift-default
+spec:
+  controllerName: "openshift.io/gateway-controller/v1"
+---
+# Default LLMInferenceService Gateway (for ODH/RHOAI managed models)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: openshift-ai-inference
+  namespace: openshift-ingress
+spec:
+  gatewayClassName: openshift-default
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+# MaaS Default Gateway (for MaaS-managed models with policies)
+# NOTE: Replace ${CLUSTER_DOMAIN} with your actual cluster domain
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-default-gateway
+  namespace: openshift-ingress
+  annotations:
+    opendatahub.io/managed: "false"
+  labels:
+    app.kubernetes.io/name: maas
+    app.kubernetes.io/instance: maas-default-gateway
+    app.kubernetes.io/component: gateway
+    opendatahub.io/managed: "false"
+spec:
+  gatewayClassName: openshift-default
+  listeners:
+   - name: http
+     hostname: maas.${CLUSTER_DOMAIN}
+     port: 80
+     protocol: HTTP
+     allowedRoutes:
+       namespaces:
+         from: All
+   - name: https
+     hostname: maas.${CLUSTER_DOMAIN}
+     port: 443
+     protocol: HTTPS
+     allowedRoutes:
+       namespaces:
+         from: All
+     tls:
+       certificateRefs:
+       - group: ''
+         kind: Secret
+         name: default-gateway-tls
+       mode: Terminate
+
+---
+#################################################################################
+# SECTION 4: KUADRANT INSTANCE
+#################################################################################
+# Wait for Kuadrant operators to be ready before applying this
+# Check: oc wait --for=condition=Available deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s
+#################################################################################
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: kuadrant-system
+spec: {}
+
+---
+#################################################################################
+# SECTION 5: MAAS API COMPONENTS
+#################################################################################
+# RBAC
+#################################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maas-api
+  namespace: maas-api
+  labels:
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maas-api
+  labels:
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
+
+# SA token provider resources
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  verbs: ["create"]
+
+# Token review for authentication
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["tokenreviews"]
+  verbs: ["create"]
+
+# KServe resources for model management
+- apiGroups: ["serving.kserve.io"]
+  resources: ["inferenceservices", "llminferenceservices"]
+  verbs: ["get", "list", "watch"]
+
+# Metrics and monitoring
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-api
+  labels:
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maas-api
+subjects:
+- kind: ServiceAccount
+  name: maas-api
+  namespace: maas-api
+
+---
+#################################################################################
+# SECTION 5: MAAS API COMPONENTS (continued)
+#################################################################################
+# Configuration
+#################################################################################
+# Tier to Group Mapping for MaaS API
+# This ConfigMap defines which user groups belong to each tier
+# Users in higher tier groups get higher rate limits
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tier-to-group-mapping
+  namespace: maas-api
+  labels:
+    app: maas-api
+    component: tier-mapping
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+data:
+  tiers: |
+    # Free tier - default for all authenticated users
+    - name: free
+      level: 0
+      groups:
+        - tier-free-users
+        - system:authenticated  # Default for all authenticated users
+    
+    # Premium tier - for premium users
+    - name: premium
+      level: 1
+      groups:
+        - tier-premium-users
+        - premium-group
+    
+    # Enterprise tier - highest level
+    - name: enterprise
+      level: 2
+      groups:
+        - tier-enterprise-users
+        - enterprise-group
+        - admin-group
+
+---
+#################################################################################
+# SECTION 5: MAAS API COMPONENTS (continued)
+#################################################################################
+# Deployment
+#################################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maas-api
+  namespace: maas-api
+  labels:
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: maas-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: model-as-a-service
+        app.kubernetes.io/component: api
+        app.kubernetes.io/name: maas-api
+    spec:
+      serviceAccountName: maas-api
+      securityContext:
+        runAsNonRoot: true
+      containers:
+      - name: maas-api
+        image: quay.io/opendatahub/maas-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: PROVIDER
+          value: sa-tokens
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-api
+  namespace: maas-api
+  labels:
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+spec:
+  selector:
+    app.kubernetes.io/name: maas-api
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  type: ClusterIP
+
+---
+#################################################################################
+# SECTION 5: MAAS API COMPONENTS (continued)
+#################################################################################
+# Networking
+#################################################################################
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: maas-api-route
+  namespace: maas-api
+  labels:
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+spec:
+  parentRefs:
+    - name: maas-default-gateway
+      namespace: openshift-ingress
+  rules:
+    # OpenAI-compatible /v1/models endpoint at top level
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/models
+      backendRefs:
+        - name: maas-api
+          port: 8080
+          weight: 100
+    # All other maas-api endpoints remain under /maas-api prefix
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /maas-api
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: maas-api
+          port: 8080
+          weight: 100
+
+---
+#################################################################################
+# SECTION 5: MAAS API COMPONENTS (continued)
+#################################################################################
+# MaaS API Authentication Policy
+#################################################################################
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: maas-api-auth-policy
+  namespace: maas-api
+  labels:
+    app.kubernetes.io/part-of: model-as-a-service
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: maas-api
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: maas-api-route
+  rules:
+    # Allow any authenticated user to access the API
+    authentication:
+      openshift-identities:
+        kubernetesTokenReview:
+          audiences:
+            - https://kubernetes.default.svc
+            - maas-default-gateway-sa
+
+---
+#################################################################################
+# SECTION 6: GATEWAY POLICIES
+#################################################################################
+# Global policies applied at the Gateway level
+# NOTE: These require Kuadrant CRDs to be installed
+#################################################################################
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: gateway-auth-policy
+  namespace: openshift-ingress
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: maas-default-gateway
+  rules:
+    metadata:
+      # Enriching identity metadata with a proper subscription tier based on user groups
+      matchedTier:
+        http:
+          # TODO: network policy to limit access to this endpoint
+          url: http://maas-api.maas-api.svc.cluster.local:8080/v1/tiers/lookup
+          contentType: application/json
+          method: POST
+          body:
+            expression: |-
+              { "groups": auth.identity.user.groups }
+        cache:
+          key:
+            selector: auth.identity.user.username
+          ttl: 300
+    authentication:
+      service-accounts:
+        kubernetesTokenReview:
+          audiences:
+            - maas-default-gateway-sa
+        defaults:
+          # token normalization - https://docs.kuadrant.io/1.2.x/authorino/docs/user-guides/token-normalization/
+          # full username: system:serviceaccount:<ns>:<name>
+          userid:
+            expression: |
+              auth.identity.user.username.split(":")[3]
+    authorization:
+      tier-access:
+        kubernetesSubjectAccessReview:
+          user:
+            expression: auth.identity.user.username
+          authorizationGroups:
+            expression: auth.identity.user.groups
+          resourceAttributes:
+            group:
+              value: serving.kserve.io
+            resource:
+              value: llminferenceservices
+            namespace:
+              expression: |
+                request.path.split("/")[1]
+            name:
+              expression: |
+                request.path.split("/")[2]
+            verb:
+              value: post
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                userid:
+                  expression: auth.identity.userid
+                tier:
+                  expression: auth.metadata.matchedTier["tier"]
+---
+# Gateway-level Token Rate Limiting Policy
+# Automatically tracks tokens from response bodies (usage.total_tokens)
+# Uses the same user groups as the auth policy configuration
+apiVersion: kuadrant.io/v1alpha1
+kind: TokenRateLimitPolicy
+metadata:
+  name: gateway-token-rate-limits
+  namespace: openshift-ingress
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: maas-default-gateway
+  limits:
+    free-user-tokens:
+      rates:
+        - limit: 100
+          window: 1m
+      when:
+        - predicate: |
+            auth.identity.tier == "free"
+      counters:
+        - expression: auth.identity.userid
+    
+    premium-user-tokens:
+      rates:
+        - limit: 50000
+          window: 1m
+      when:
+        - predicate: |
+            auth.identity.tier == "premium"
+      counters:
+        - expression: auth.identity.userid
+    enterprise-user-tokens:
+      rates:
+        - limit: 100000
+          window: 1m
+      when:
+        - predicate: |
+            auth.identity.tier == "enterprise"
+      counters:
+        - expression: auth.identity.userid
+---
+# Gateway-level Request Rate Limiting Policy
+apiVersion: kuadrant.io/v1
+kind: RateLimitPolicy
+metadata:
+  name: gateway-rate-limits
+  namespace: openshift-ingress
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: maas-default-gateway
+  limits:
+    free:
+      rates:
+        - limit: 5
+          window: 2m
+      when:
+        - predicate: |
+            auth.identity.tier == "free"
+      counters:
+        - expression: auth.identity.userid
+    premium:
+      rates:
+        - limit: 20
+          window: 2m
+      when:
+        - predicate: |
+            auth.identity.tier == "premium"
+      counters:
+        - expression: auth.identity.userid
+    enterprise:
+      rates:
+        - limit: 50
+          window: 2m
+      when:
+        - predicate: |
+            auth.identity.tier == "enterprise"
+      counters:
+        - expression: auth.identity.userid
+
+---
+#################################################################################
+# SECTION 7: OBSERVABILITY
+#################################################################################
+# Prometheus ServiceMonitor and Telemetry Policy
+#################################################################################
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: limitador-metrics
+  namespace: kuadrant-system
+  labels:
+    app: limitador
+    app.kubernetes.io/part-of: maas-observability
+spec:
+  selector:
+    matchLabels:
+      app: limitador
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: extensions.kuadrant.io/v1alpha1
+kind: TelemetryPolicy
+metadata:
+  name: user-group
+  namespace: openshift-ingress
+  labels:
+    app.kubernetes.io/part-of: maas-observability
+spec:
+  metrics:
+    default:
+      labels:
+        model: responseBodyJSON("/model")
+        tier: auth.identity.tier
+        user: auth.identity.userid
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: maas-default-gateway
+
+#################################################################################
+# END OF MANIFEST
+#################################################################################
+# 
+# POST-DEPLOYMENT STEPS:
+#
+# 1. Wait for Kuadrant operators to be ready (5-10 minutes):
+#    oc wait --for=condition=Available deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=600s
+#    oc wait --for=condition=Available deployment/limitador-operator-controller-manager -n kuadrant-system --timeout=300s
+#    oc wait --for=condition=Available deployment/authorino-operator -n openshift-operators --timeout=300s
+#
+# 2. Wait for all CSVs to succeed:
+#    oc get csv -n kuadrant-system
+#    # Should show: kuadrant-operator.v1.3.0, authorino-operator.v0.22.0, 
+#    #              limitador-operator.v0.16.0, dns-operator.v0.15.0
+#
+# 3. Patch the Gateway Controller environment variable:
+#    oc -n kuadrant-system patch deployment kuadrant-operator-controller-manager --type='json' \
+#      -p='[{"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {"name": "ISTIO_GATEWAY_CONTROLLER_NAMES", "value": "openshift.io/gateway-controller/v1"}}]'
+#    oc rollout restart deployment/kuadrant-operator-controller-manager -n kuadrant-system
+#
+# 4. Wait for Gateway to be ready:
+#    oc wait --for=condition=Programmed gateway maas-default-gateway -n openshift-ingress --timeout=300s
+#
+# 5. Patch AuthPolicy audience (if needed):
+#    AUD="$(oc create token default --duration=10m 2>/dev/null | cut -d. -f2 | base64 -d 2>/dev/null | jq -r '.aud[0]' 2>/dev/null)"
+#    oc patch authpolicy maas-api-auth-policy -n maas-api \
+#      --type='json' \
+#      -p "$(jq -nc --arg aud "$AUD" '[{"op":"replace","path":"/spec/rules/authentication/openshift-identities/kubernetesTokenReview/audiences/0","value":$aud}]')"
+#
+# 6. Update Limitador image for metrics:
+#    oc -n kuadrant-system patch limitador limitador --type merge \
+#      -p '{"spec":{"image":"quay.io/kuadrant/limitador:1a28eac1b42c63658a291056a62b5d940596fd4c","version":""}}'
+#
+# 7. Restart operators (workaround for webhook issues):
+#    oc delete pod -n kuadrant-system -l control-plane=controller-manager
+#    oc rollout restart deployment authorino-operator -n kuadrant-system
+#    oc rollout restart deployment limitador-operator-controller-manager -n kuadrant-system
+#
+# 8. Deploy a test model:
+#    kustomize build docs/samples/models/simulator | oc apply -f -
+#
+# 9. Test the deployment:
+#    ./deployment/scripts/validate-deployment.sh
+#
+#################################################################################
+

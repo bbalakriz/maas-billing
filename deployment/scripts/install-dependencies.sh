@@ -99,11 +99,11 @@ install_component() {
     # Inline handler for Kuadrant (installed via OLM)
     if [[ "$component" == "kuadrant" ]]; then
         # Ensure kuadrant-system namespace exists
-        kubectl create namespace kuadrant-system 2>/dev/null || echo "✅ Namespace kuadrant-system already exists"
+        oc create namespace kuadrant-system 2>/dev/null || echo "✅ Namespace kuadrant-system already exists"
 
 
         echo "🚀 Creating Kuadrant OperatorGroup..."
-        kubectl apply -f - <<EOF
+        oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -113,11 +113,11 @@ spec: {}
 EOF
 
         # Check if the CatalogSource already exists before applying
-        if kubectl get catalogsource kuadrant-operator-catalog -n kuadrant-system &>/dev/null; then
+        if oc get catalogsource kuadrant-operator-catalog -n kuadrant-system &>/dev/null; then
             echo "✅ Kuadrant CatalogSource already exists in namespace kuadrant-system, skipping creation."
         else
             echo "🚀 Creating Kuadrant CatalogSource..."
-            kubectl apply -f - <<EOF
+            oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: CatalogSource
 metadata:
@@ -135,7 +135,7 @@ EOF
 
 
         echo "🚀 Installing kuadrant (via OLM Subscription)..."
-        kubectl apply -f - <<EOF
+        oc apply -f - <<EOF
   apiVersion: operators.coreos.com/v1alpha1
   kind: Subscription
   metadata:
@@ -153,7 +153,7 @@ EOF
         MAX_ATTEMPTS=7
         while true; do
 
-            if kubectl get deployment/kuadrant-operator-controller-manager -n kuadrant-system &>/dev/null; then
+            if oc get deployment/kuadrant-operator-controller-manager -n kuadrant-system &>/dev/null; then
                 break
             else
                 ATTEMPTS=$((ATTEMPTS+1))
@@ -167,16 +167,16 @@ EOF
         done
 
         echo "⏳ Waiting for operators to be ready..."
-        kubectl wait --for=condition=Available deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s
-        kubectl wait --for=condition=Available deployment/limitador-operator-controller-manager -n kuadrant-system --timeout=300s
-        kubectl wait --for=condition=Available deployment/authorino-operator -n kuadrant-system --timeout=300s
+        oc wait --for=condition=Available deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s
+        oc wait --for=condition=Available deployment/limitador-operator-controller-manager -n kuadrant-system --timeout=300s
+        oc wait --for=condition=Available deployment/authorino-operator -n openshift-operators --timeout=300s
 
         sleep 5
 
         # Patch Kuadrant for OpenShift Gateway Controller
         echo "   Patching Kuadrant operator..."
-        if ! kubectl -n kuadrant-system get deployment kuadrant-operator-controller-manager -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ISTIO_GATEWAY_CONTROLLER_NAMES")]}' | grep -q "ISTIO_GATEWAY_CONTROLLER_NAMES"; then
-          kubectl patch csv kuadrant-operator.v1.3.0 -n kuadrant-system --type='json' -p='[
+        if ! oc -n kuadrant-system get deployment kuadrant-operator-controller-manager -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ISTIO_GATEWAY_CONTROLLER_NAMES")]}' | grep -q "ISTIO_GATEWAY_CONTROLLER_NAMES"; then
+          oc patch csv kuadrant-operator.v1.3.0 -n kuadrant-system --type='json' -p='[
             {
               "op": "add",
               "path": "/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/-",
